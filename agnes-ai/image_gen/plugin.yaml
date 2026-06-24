@@ -1,0 +1,6 @@
+name: image_gen
+version: 1.0.0
+description: "Agnes AI image generation backend for /v1/images/generations."
+author: local
+kind: backend
+requires_env: []

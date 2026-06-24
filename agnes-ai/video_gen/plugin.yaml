@@ -1,0 +1,6 @@
+name: video_gen
+version: 1.0.0
+description: "Agnes AI video generation backend for Agnes-Video-V2.0."
+author: local
+kind: backend
+requires_env: []

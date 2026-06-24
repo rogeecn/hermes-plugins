@@ -1,0 +1,5 @@
+name: cpa-provider
+kind: model-provider
+version: 1.0.0
+description: CPA OpenAI-compatible endpoint
+author: local
