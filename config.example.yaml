@@ -1,0 +1,73 @@
+# ─────────────────────────────────────────────────────────────
+# Hermes Plugins — config.yaml Example
+# ─────────────────────────────────────────────────────────────
+# This is a reference for the config.yaml sections relevant to
+# the plugins in this repo.  Copy the parts you need into your
+# actual config.yaml (located at ~/.hermes/config.yaml or
+# $HERMES_HOME/config.yaml).
+#
+# Full config reference: https://hermes-agent.nousresearch.com/docs/user-guide/configuration
+# ─────────────────────────────────────────────────────────────
+
+# ── Plugins ──────────────────────────────────────────────────
+# Opt-in list: only plugins named here are loaded.
+# Keys are path-derived from the plugin directory structure.
+plugins:
+  enabled:
+    - agnes-ai/image_gen        # Agnes AI image generation backend
+    - agnes-ai/video_gen        # Agnes AI video generation backend
+    # - model-providers/cpa      # CPA model provider (auto-discovered, no need to list)
+
+# ── Model Provider (CPA) ─────────────────────────────────────
+# Main LLM model configuration.
+model:
+  default: glm-5.2              # CPA model: glm-5.2, deepseek-v4-flash, qwen3.5-122b-a10b, etc.
+  provider: cpa
+
+# Provider-specific overrides (optional, usually empty = use defaults)
+providers:
+  cpa: {}
+
+# ── Image Generation ────────────────────────────────────────
+# Backend: Agnes AI (agnes-image-2.0-flash / agnes-image-2.1-flash)
+# Supports: text-to-image, image-to-image, multi-image composition
+image_gen:
+  provider: agnes
+  model: agnes-image-2.0-flash
+
+# ── Video Generation ─────────────────────────────────────────
+# Backend: Agnes AI (agnes-video-v2.0)
+# Supports: text-to-video, image-to-video, keyframe animation (async)
+video_gen:
+  provider: agnes
+  model: agnes-video-v2.0
+
+# ── Auxiliary Models ────────────────────────────────────────
+# Optional: route side-tasks to specific CPA models for cost/latency tuning.
+# All auxiliary tasks default to provider "auto" when not specified.
+auxiliary:
+  vision:
+    provider: cpa
+    model: qwen3.5-122b-a10b
+  title_generation:
+    provider: cpa
+    model: deepseek-v4-flash
+  compression:
+    provider: cpa
+    model: deepseek-v4-flash
+  web_extract:
+    provider: cpa
+    model: deepseek-v4-flash
+  approval:
+    provider: cpa
+    model: deepseek-v4-flash
+
+# ── Toolsets (optional) ──────────────────────────────────────
+# Enable image_gen and video_gen toolsets per platform.
+# platform_toolsets:
+#   cli:
+#     - image_gen
+#     - video_gen
+#   matrix:
+#     - image_gen
+#     - video_gen
