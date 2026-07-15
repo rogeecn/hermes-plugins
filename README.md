@@ -57,9 +57,11 @@ video_gen:
 ### 3. Sync
 
 ```bash
-./sync.sh          # sync all plugins from ~/.hermes/plugins/
-./sync.sh agnes-ai # sync a single plugin
-./sync.sh --dry    # preview changes
+# Push repo plugins to ~/.hermes/plugins/ and all profiles
+./sync-to-hermes.sh
+
+# Pull ~/.hermes/plugins/ back into repo (after live editing)
+./sync.sh
 ```
 
 ### 4. Restart
