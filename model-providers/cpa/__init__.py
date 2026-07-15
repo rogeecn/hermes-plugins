@@ -10,7 +10,7 @@ cpa = ProviderProfile(
     display_name="CPA",
     description="CPA OpenAI-compatible endpoint",
     env_vars=("CPA_API_KEY", "CPA_BASE_URL"),
-    base_url="https://cpa.ipao.vip/v1",
+    base_url="http://10.58.144.6:2014/v1",
     auth_type="api_key",
     fallback_models=("Hermes",),
 )

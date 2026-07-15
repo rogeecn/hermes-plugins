@@ -1,255 +1,167 @@
-"""Agnes AI video generation backend for Hermes.
+"""Agnes AI video generation backend.
 
-Implements Agnes-Video-V2.0 asynchronous API:
-POST /videos -> task id, then GET /videos/{task_id} until completed.
+Wraps the Agnes AI video API (agnes-video-v2.0) as a
+:class:`VideoGenProvider` implementation.
 
-Configuration uses video_gen settings:
+API docs: https://agnes-ai.com/zh-Hans/docs/quickstart
+Endpoints:
+  Create task: POST https://apihub.agnes-ai.com/v1/videos
+  Get result:  GET  https://apihub.agnes-ai.com/agnesapi?video_id=<VIDEO_ID>
 
-    video_gen.api_key
-    video_gen.base_url   (optional; defaults to built-in Agnes endpoint)
-    video_gen.model
-    video_gen.timeout
-    video_gen.poll_interval
+Supports:
+  - Text-to-video (文生视频)
+  - Image-to-video (图生视频) — pass image_url
+  - Keyframe animation (关键帧动画) — pass reference_image_urls
+
+Auth: AGNES_API_KEY env var (Bearer token)
+Base URL: AGNES_BASE_URL env var (default: https://apihub.agnes-ai.com/v1)
+
+Video generation is asynchronous: create a task → poll for completion →
+download the resulting MP4 to local cache.
 """
+
 from __future__ import annotations
 
 import logging
-import math
 import os
 import time
 from typing import Any, Dict, List, Optional
-from urllib.parse import urlparse
 
-import requests
+import httpx
 
 from agent.video_gen_provider import (
+    COMMON_ASPECT_RATIOS,
     DEFAULT_ASPECT_RATIO,
     DEFAULT_RESOLUTION,
     VideoGenProvider,
     error_response,
     success_response,
+    save_bytes_video,
 )
 
 logger = logging.getLogger(__name__)
 
-_MODEL = "agnes-video-v2.0"
-_DEFAULT_BASE_URL = "https://apihub.agnes-ai.com/v1"
-_DEFAULT_FPS = 24
-_DEFAULT_FRAMES = 121
-_MAX_FRAMES = 441
+# ── Constants ────────────────────────────────────────────────────────
 
-_ASPECT_TO_SIZE: Dict[str, tuple[int, int]] = {
-    "16:9": (1280, 720),
-    "9:16": (720, 1280),
-    "1:1": (768, 768),
-    "4:3": (1024, 768),
-    "3:4": (768, 1024),
-    "3:2": (1152, 768),
-    "2:3": (768, 1152),
-}
-_RESOLUTION_SCALE: Dict[str, int] = {
-    "480p": 480,
-    "540p": 540,
-    "720p": 720,
-    "1080p": 1080,
+DEFAULT_BASE_URL = "https://apihub.agnes-ai.com/v1"
+DEFAULT_MODEL = "agnes-video-v2.0"
+DEFAULT_TIMEOUT = 300          # total poll budget
+DEFAULT_POLL_INTERVAL = 5      # seconds between polls
+DEFAULT_DURATION = 5            # seconds
+DEFAULT_FRAME_RATE = 24
+
+# num_frames must follow 8n+1 rule and ≤441
+# 81 → ~3s, 121 → ~5s, 241 → ~10s, 441 → ~18s
+_DURATION_TO_NUM_FRAMES: Dict[int, int] = {
+    3: 81,
+    5: 121,
+    10: 241,
+    18: 441,
 }
 
-_COMPLETED_STATUSES = {"completed", "succeeded", "success", "done"}
-_FAILED_STATUSES = {"failed", "error", "cancelled", "canceled"}
+# Resolution → height/width mapping (16:9 landscape default)
+_RESOLUTION_TO_DIMS: Dict[str, Dict[str, int]] = {
+    "480p": {"height": 480, "width": 854},
+    "540p": {"height": 540, "width": 960},
+    "720p": {"height": 768, "width": 1152},   # Agnes standard 720p
+    "1080p": {"height": 1080, "width": 1920},
+}
+
+# Aspect ratio → swap width/height
+_ASPECT_IS_PORTRAIT = {"9:16", "3:4", "2:3"}
+_ASPECT_IS_SQUARE = {"1:1"}
+
+_MODELS: Dict[str, Dict[str, Any]] = {
+    "agnes-video-v2.0": {
+        "display": "Agnes Video V2.0",
+        "speed": "~60-240s",
+        "strengths": "Text-to-video, image-to-video, keyframe animation; cinematic quality",
+        "price": "$0/sec (free tier)",
+        "modalities": ["text", "image"],
+    },
+}
 
 
-def _is_http_url(value: str) -> bool:
-    parsed = urlparse(value)
-    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+def _resolve_credentials() -> tuple[str, str]:
+    """Return (api_key, base_url) from env vars."""
+    api_key = os.getenv("AGNES_API_KEY", "").strip()
+    base_url = os.getenv("AGNES_BASE_URL", "").strip().rstrip("/") or DEFAULT_BASE_URL
+    return api_key, base_url
 
 
-def _normalize_urls(value: Any) -> List[str]:
-    if value is None:
-        return []
-    if isinstance(value, str):
-        items = [value]
-    elif isinstance(value, (list, tuple)):
-        items = list(value)
-    else:
-        return []
-
-    urls: List[str] = []
-    for item in items:
-        url = str(item or "").strip()
-        if not url:
-            continue
-        if not _is_http_url(url):
-            raise ValueError(
-                f"Agnes video input images must be HTTP(S) URLs: {url}")
-        if url not in urls:
-            urls.append(url)
-    return urls
+def _resolve_dims(
+    resolution: str,
+    aspect_ratio: str,
+) -> tuple[int, int]:
+    """Return (height, width) for the given resolution and aspect ratio."""
+    dims = _RESOLUTION_TO_DIMS.get(resolution, _RESOLUTION_TO_DIMS["720p"])
+    h, w = dims["height"], dims["width"]
+    if aspect_ratio in _ASPECT_IS_PORTRAIT:
+        h, w = w, h  # swap for portrait
+    elif aspect_ratio in _ASPECT_IS_SQUARE:
+        h = w = min(h, w)
+    return h, w
 
 
-def _load_config() -> Dict[str, Any]:
-    try:
-        from hermes_cli.config import load_config
-
-        cfg = load_config()
-        video_cfg = cfg.get("video_gen") if isinstance(cfg, dict) else None
-        if isinstance(video_cfg, dict):
-            return {
-                k: v
-                for k, v in video_cfg.items() if v not in (None, "")
-            }
-        return {}
-    except Exception as exc:
-        logger.debug("Could not load Agnes video config: %s", exc)
-        return {}
-
-
-def _coerce_positive_int(value: Any, default: int) -> int:
-    try:
-        n = int(value)
-        return n if n > 0 else default
-    except Exception:
-        return default
-
-
-def _frames_for_duration(duration: Optional[int]) -> int:
-    if not duration:
-        return _DEFAULT_FRAMES
-    target = max(1, int(duration)) * _DEFAULT_FPS
-    target = min(target, _MAX_FRAMES)
-    # Agnes requires 8n + 1. Use nearest valid frame count, minimum 9.
-    n = max(1, round((target - 1) / 8))
-    frames = 8 * n + 1
-    return min(frames, _MAX_FRAMES)
-
-
-def _size_for(aspect_ratio: str, resolution: str) -> tuple[int, int]:
-    width, height = _ASPECT_TO_SIZE.get(aspect_ratio,
-                                        _ASPECT_TO_SIZE[DEFAULT_ASPECT_RATIO])
-    target_short = _RESOLUTION_SCALE.get(resolution,
-                                         _RESOLUTION_SCALE[DEFAULT_RESOLUTION])
-    short = min(width, height)
-    scale = target_short / short
-    width = int(round(width * scale / 8) * 8)
-    height = int(round(height * scale / 8) * 8)
-    return max(8, width), max(8, height)
-
-
-def _extract_task_id(result: Dict[str, Any]) -> Optional[str]:
-    body = result.get("body") if isinstance(result.get("body"),
-                                            dict) else result
-    for key in ("task_id", "id"):
-        value = body.get(key) if isinstance(body, dict) else None
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return None
-
-
-def _extract_status(result: Dict[str, Any]) -> str:
-    body = result.get("body") if isinstance(result.get("body"),
-                                            dict) else result
-    value = body.get("status") if isinstance(body, dict) else None
-    return str(value or "").strip().lower()
-
-
-def _extract_body(result: Dict[str, Any]) -> Dict[str, Any]:
-    body = result.get("body") if isinstance(result.get("body"),
-                                            dict) else result
-    return body if isinstance(body, dict) else {}
-
-
-def _extract_video_url(result: Dict[str, Any]) -> Optional[str]:
-    body = _extract_body(result)
-    candidates = [
-        body.get("video_url"),
-        body.get("url"),
-        body.get("remixed_from_video_id"
-                 ),  # present in Agnes docs final response example
-    ]
-    data = body.get("data")
-    if isinstance(data, dict):
-        candidates.extend([data.get("video_url"), data.get("url")])
-    if isinstance(data, list) and data:
-        first = data[0]
-        if isinstance(first, dict):
-            candidates.extend([first.get("video_url"), first.get("url")])
-    for value in candidates:
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return None
-
-
-def _http_error(exc: requests.HTTPError) -> str:
-    resp = exc.response
-    status = resp.status_code if resp is not None else 0
-    try:
-        body = resp.json() if resp is not None else {}
-        if isinstance(body, dict):
-            err_obj = body.get("error")
-            if isinstance(err_obj, dict):
-                msg = err_obj.get("message") or str(err_obj)
-            else:
-                msg = err_obj or body.get("message") or str(body)
-        else:
-            msg = str(body)
-    except Exception:
-        msg = resp.text[:500] if resp is not None else str(exc)
-    return f"Agnes video API failed ({status}): {msg}"
+def _resolve_num_frames(duration: Optional[int]) -> int:
+    """Map duration in seconds to the nearest valid num_frames (8n+1 rule)."""
+    if duration is None:
+        return _DURATION_TO_NUM_FRAMES[DEFAULT_DURATION]
+    # Find closest supported duration
+    closest = min(_DURATION_TO_NUM_FRAMES.keys(), key=lambda d: abs(d - duration))
+    return _DURATION_TO_NUM_FRAMES[closest]
 
 
 class AgnesVideoGenProvider(VideoGenProvider):
+    """Agnes AI video generation backend."""
 
     @property
     def name(self) -> str:
-        return "agnes-ai"
+        return "agnes"
 
     @property
     def display_name(self) -> str:
-        return "Agnes AI Video"
+        return "Agnes AI"
 
     def is_available(self) -> bool:
-        cfg = _load_config()
-        api_key = str(
-            cfg.get("api_key")
-            or os.environ.get("AGNES_AI_API_KEY", "")).strip()
-        base_url = str(cfg.get("base_url") or _DEFAULT_BASE_URL).strip()
-        return bool(api_key and base_url)
+        api_key, _ = _resolve_credentials()
+        return bool(api_key)
 
     def list_models(self) -> List[Dict[str, Any]]:
-        return [{
-            "id": _MODEL,
-            "display": "Agnes Video V2.0",
-            "speed": "async / polling",
-            "strengths":
-            "text-to-video, image-to-video, multi-image video, keyframe animation",
-            "modalities": ["text", "image"],
-        }]
+        return [{"id": mid, **meta} for mid, meta in _MODELS.items()]
 
-    def default_model(self) -> str:
-        cfg = _load_config()
-        return str(cfg.get("model") or _MODEL).strip() or _MODEL
+    def default_model(self) -> Optional[str]:
+        return DEFAULT_MODEL
+
+    def get_setup_schema(self) -> Dict[str, Any]:
+        return {
+            "name": "Agnes AI Video",
+            "badge": "free",
+            "tag": "agnes-video-v2.0 — text-to-video, image-to-video, keyframe animation (async)",
+            "env_vars": [
+                {
+                    "key": "AGNES_API_KEY",
+                    "prompt": "Agnes AI API key",
+                    "url": "https://agnes-ai.com",
+                },
+                {
+                    "key": "AGNES_BASE_URL",
+                    "prompt": "Agnes AI base URL (default: https://apihub.agnes-ai.com/v1)",
+                    "url": "",
+                },
+            ],
+        }
 
     def capabilities(self) -> Dict[str, Any]:
         return {
             "modalities": ["text", "image"],
-            "aspect_ratios": list(_ASPECT_TO_SIZE.keys()),
-            "resolutions": list(_RESOLUTION_SCALE.keys()),
+            "aspect_ratios": list(COMMON_ASPECT_RATIOS),
+            "resolutions": ["480p", "540p", "720p", "1080p"],
             "max_duration": 18,
-            "min_duration": 1,
+            "min_duration": 3,
             "supports_audio": False,
             "supports_negative_prompt": True,
-            "max_reference_images": 16,
-            "supports_multi_image": True,
-            "supports_keyframes": True,
-        }
-
-    def get_setup_schema(self) -> Dict[str, Any]:
-        return {
-            "name": "Agnes AI",
-            "badge": "free",
-            "tag": "Video generate by Agnes AI",
-            "env_vars": [{
-                "key": "AGNES_AI_API_KEY"
-            }],
+            "max_reference_images": 4,
         }
 
     def generate(
@@ -267,227 +179,217 @@ class AgnesVideoGenProvider(VideoGenProvider):
         seed: Optional[int] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        cfg = _load_config()
-        api_key = str(
-            cfg.get("api_key")
-            or os.environ.get("AGNES_AI_API_KEY", "")).strip()
-        base_url = str(cfg.get("base_url")
-                       or _DEFAULT_BASE_URL).strip().rstrip("/")
-        model_id = str(model or cfg.get("model") or _MODEL).strip() or _MODEL
-        if model_id != _MODEL:
-            logger.debug("Agnes video model override %r normalized to %s",
-                         model_id, _MODEL)
-            model_id = _MODEL
+        """Generate a video via the Agnes AI async video API.
 
-        if not prompt or not str(prompt).strip():
-            return error_response(error="Prompt is required",
-                                  error_type="invalid_argument",
-                                  provider=self.name,
-                                  model=model_id,
-                                  aspect_ratio=aspect_ratio)
+        Routing:
+          - image_url present → image-to-video
+          - reference_image_urls present → keyframe animation
+          - otherwise → text-to-video
+        """
+        api_key, base_url = _resolve_credentials()
         if not api_key:
             return error_response(
-                error="video_gen.api_key is required",
-                error_type="auth_required",
-                provider=self.name,
-                model=model_id,
+                error="AGNES_API_KEY not set",
+                error_type="auth_missing",
+                provider="agnes",
+                model=model or DEFAULT_MODEL,
                 prompt=prompt,
-                aspect_ratio=aspect_ratio)
-        if not base_url:
-            return error_response(
-                error="video_gen.base_url is required",
-                error_type="auth_required",
-                provider=self.name,
-                model=model_id,
-                prompt=prompt,
-                aspect_ratio=aspect_ratio)
+                aspect_ratio=aspect_ratio,
+            )
 
-        try:
-            primary_images = _normalize_urls(image_url)
-            reference_images = _normalize_urls(reference_image_urls)
-        except ValueError as exc:
-            return error_response(error=str(exc),
-                                  error_type="invalid_argument",
-                                  provider=self.name,
-                                  model=model_id,
-                                  prompt=prompt,
-                                  aspect_ratio=aspect_ratio)
+        used_model = (model or DEFAULT_MODEL).strip()
+        h, w = _resolve_dims(resolution, aspect_ratio)
+        num_frames = _resolve_num_frames(duration)
+        modality = "text"
 
-        all_images = primary_images + [
-            u for u in reference_images if u not in primary_images
-        ]
-        mode = str(kwargs.get("mode") or kwargs.get("generation_mode")
-                   or "").strip().lower()
-        if mode in {"keyframe", "keyframes", "keyframe_animation"}:
-            mode = "keyframes"
-        elif mode in {
-                "multi", "multi_image", "multi-image", "multi_image_video"
-        }:
-            mode = "multi_image"
-        elif not mode:
-            mode = "image" if all_images else "text"
-
-        width, height = _size_for(aspect_ratio, resolution)
-        frames = _coerce_positive_int(kwargs.get("num_frames"),
-                                      _frames_for_duration(duration))
-        if frames > _MAX_FRAMES:
-            frames = _MAX_FRAMES
-        if (frames - 1) % 8 != 0:
-            frames = 8 * max(1, round((frames - 1) / 8)) + 1
-            frames = min(frames, _MAX_FRAMES)
-        fps = _coerce_positive_int(kwargs.get("frame_rate"), _DEFAULT_FPS)
-        fps = max(1, min(60, fps))
-        actual_duration = max(1, int(round(frames / fps)))
-
-        payload: Dict[str, Any] = {
-            "model": _MODEL,
-            "prompt": str(prompt).strip(),
-            "height": height,
-            "width": width,
-            "num_frames": frames,
-            "frame_rate": fps,
+        # Build request body
+        body: Dict[str, Any] = {
+            "model": used_model,
+            "prompt": prompt,
+            "height": h,
+            "width": w,
+            "num_frames": num_frames,
+            "frame_rate": DEFAULT_FRAME_RATE,
         }
+
+        if image_url:
+            body["image"] = image_url
+            body["mode"] = "ti2vid"
+            modality = "image"
+
+        if reference_image_urls:
+            body["extra_body"] = {
+                "image": reference_image_urls,
+                "mode": "keyframes",
+            }
+            modality = "image"
+
         if negative_prompt:
-            payload["negative_prompt"] = negative_prompt
+            body["negative_prompt"] = negative_prompt
+
         if seed is not None:
-            payload["seed"] = int(seed)
+            body["seed"] = seed
 
-        # Agnes docs distinguish single image via top-level `image`; multi-image
-        # and keyframes via `extra_body.image`, with `extra_body.mode=keyframes`.
-        if mode == "keyframes":
-            if len(all_images) < 2:
-                return error_response(
-                    error="Keyframe animation requires at least two image URLs",
-                    error_type="invalid_argument",
-                    provider=self.name,
-                    model=model_id,
-                    prompt=prompt,
-                    aspect_ratio=aspect_ratio)
-            payload["extra_body"] = {"image": all_images, "mode": "keyframes"}
-        elif len(all_images) > 1 or mode == "multi_image":
-            if not all_images:
-                return error_response(
-                    error="Multi-image video requires image URLs",
-                    error_type="invalid_argument",
-                    provider=self.name,
-                    model=model_id,
-                    prompt=prompt,
-                    aspect_ratio=aspect_ratio)
-            payload["extra_body"] = {"image": all_images}
-        elif len(all_images) == 1:
-            payload["image"] = all_images[0]
-
+        create_url = f"{base_url}/videos"
         headers = {
             "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
         }
-        create_timeout = _coerce_positive_int(cfg.get("request_timeout"), 180)
-        poll_timeout = _coerce_positive_int(cfg.get("timeout"), 1800)
-        poll_interval = _coerce_positive_int(cfg.get("poll_interval"), 5)
 
         try:
-            create_resp = requests.post(f"{base_url}/videos",
-                                        headers=headers,
-                                        json=payload,
-                                        timeout=create_timeout)
-            create_resp.raise_for_status()
-            create_result = create_resp.json()
-            task_id = _extract_task_id(create_result)
-            if not task_id:
+            # Step 1: Create video task
+            with httpx.Client(timeout=60) as client:
+                resp = client.post(create_url, headers=headers, json=body)
+                resp.raise_for_status()
+                task = resp.json()
+
+            video_id = task.get("video_id") or task.get("task_id")
+            if not video_id:
                 return error_response(
-                    error=
-                    f"Agnes returned no task id: {str(create_result)[:500]}",
-                    error_type="empty_response",
-                    provider=self.name,
-                    model=model_id,
+                    error=f"Agnes video API returned no video_id/task_id: {task}",
+                    error_type="missing_task_id",
+                    provider="agnes",
+                    model=used_model,
                     prompt=prompt,
-                    aspect_ratio=aspect_ratio)
+                    aspect_ratio=aspect_ratio,
+                )
 
-            deadline = time.monotonic() + poll_timeout
-            last_result: Dict[str, Any] = create_result if isinstance(
-                create_result, dict) else {}
-            while time.monotonic() < deadline:
-                status = _extract_status(last_result)
-                if status in _COMPLETED_STATUSES:
-                    video_url = _extract_video_url(last_result)
-                    if not video_url:
-                        return error_response(
-                            error=
-                            f"Agnes task completed but no video URL was found: {str(last_result)[:500]}",
-                            error_type="empty_response",
-                            provider=self.name,
-                            model=model_id,
-                            prompt=prompt,
-                            aspect_ratio=aspect_ratio)
-                    modality = "image" if all_images else "text"
-                    return success_response(
-                        video=video_url,
-                        model=model_id,
-                        prompt=prompt,
-                        modality=modality,
-                        aspect_ratio=aspect_ratio,
-                        duration=actual_duration,
-                        provider=self.name,
-                        extra={
-                            "task_id": task_id,
-                            "status": status,
-                            "mode": mode,
-                            "size": f"{width}x{height}",
-                            "num_frames": frames,
-                            "frame_rate": fps,
-                        },
-                    )
-                if status in _FAILED_STATUSES:
-                    body = _extract_body(last_result)
-                    err = body.get("error") or body.get("message") or str(
-                        last_result)[:500]
-                    return error_response(
-                        error=f"Agnes video task failed: {err}",
-                        error_type="api_error",
-                        provider=self.name,
-                        model=model_id,
-                        prompt=prompt,
-                        aspect_ratio=aspect_ratio)
+            logger.info("Agnes video task created: video_id=%s, status=%s", video_id, task.get("status"))
 
-                time.sleep(poll_interval)
-                poll_resp = requests.get(
-                    f"{base_url}/videos/{task_id}",
-                    headers={"Authorization": f"Bearer {api_key}"},
-                    timeout=create_timeout)
-                poll_resp.raise_for_status()
-                polled = poll_resp.json()
-                if isinstance(polled, dict):
-                    last_result = polled
+            # Step 2: Poll for completion
+            # Agnes uses a different base for results: /agnesapi?video_id=
+            # But it's on the same host
+            poll_base = base_url.replace("/v1", "")  # → https://apihub.agnes-ai.com
+            result_url = f"{poll_base}/agnesapi"
+            video_path = self._poll_for_completion(
+                video_id, result_url, headers, api_key, base_url
+            )
 
-            return error_response(
-                error=f"Agnes video task timed out after {poll_timeout}s",
-                error_type="timeout",
-                provider=self.name,
-                model=model_id,
+            if video_path is None:
+                return error_response(
+                    error=f"Agnes video task {video_id} timed out or failed",
+                    error_type="timeout",
+                    provider="agnes",
+                    model=used_model,
+                    prompt=prompt,
+                    aspect_ratio=aspect_ratio,
+                )
+
+            actual_duration = int(num_frames / DEFAULT_FRAME_RATE)
+
+            return success_response(
+                video=video_path,
+                model=used_model,
                 prompt=prompt,
-                aspect_ratio=aspect_ratio)
-        except requests.HTTPError as exc:
-            return error_response(error=_http_error(exc),
-                                  error_type="api_error",
-                                  provider=self.name,
-                                  model=model_id,
-                                  prompt=prompt,
-                                  aspect_ratio=aspect_ratio)
-        except requests.Timeout:
-            return error_response(error="Agnes video API request timed out",
-                                  error_type="timeout",
-                                  provider=self.name,
-                                  model=model_id,
-                                  prompt=prompt,
-                                  aspect_ratio=aspect_ratio)
+                modality=modality,
+                aspect_ratio=aspect_ratio,
+                duration=actual_duration,
+                provider="agnes",
+            )
+
+        except httpx.HTTPStatusError as exc:
+            err_msg = f"Agnes API HTTP {exc.response.status_code}: {exc.response.text[:500]}"
+            logger.warning(err_msg)
+            return error_response(
+                error=err_msg,
+                error_type="api_error",
+                provider="agnes",
+                model=used_model,
+                prompt=prompt,
+                aspect_ratio=aspect_ratio,
+            )
         except Exception as exc:
-            return error_response(error=f"Agnes video API error: {exc}",
-                                  error_type="api_error",
-                                  provider=self.name,
-                                  model=model_id,
-                                  prompt=prompt,
-                                  aspect_ratio=aspect_ratio)
+            logger.warning("Agnes video generation failed: %s", exc, exc_info=True)
+            return error_response(
+                error=f"Agnes video generation failed: {exc}",
+                error_type=type(exc).__name__,
+                provider="agnes",
+                model=used_model,
+                prompt=prompt,
+                aspect_ratio=aspect_ratio,
+            )
+
+    def _poll_for_completion(
+        self,
+        video_id: str,
+        result_url: str,
+        headers: Dict[str, str],
+        api_key: str,
+        base_url: str,
+    ) -> Optional[str]:
+        """Poll the Agnes API until the video is ready; download and cache it.
+
+        Returns the local file path, or None on timeout/failure.
+        """
+        # Try the recommended endpoint first: /agnesapi?video_id=
+        # Fallback to legacy: /v1/videos/<task_id>
+        legacy_url = f"{base_url}/videos/{video_id}"
+        use_legacy = False
+
+        elapsed = 0
+        poll_interval = DEFAULT_POLL_INTERVAL
+
+        while elapsed < DEFAULT_TIMEOUT:
+            try:
+                with httpx.Client(timeout=30) as client:
+                    if not use_legacy:
+                        resp = client.get(
+                            result_url,
+                            params={"video_id": video_id},
+                            headers=headers,
+                        )
+                    else:
+                        resp = client.get(legacy_url, headers=headers)
+
+                    if resp.status_code == 404 and not use_legacy:
+                        logger.debug("Agnes recommended endpoint 404, falling back to legacy /v1/videos/<id>")
+                        use_legacy = True
+                        continue
+
+                    resp.raise_for_status()
+                    body = resp.json()
+
+                status = (body.get("status") or "").lower()
+
+                if status == "completed":
+                    video_url = body.get("url")
+                    if not video_url:
+                        logger.error("Agnes video completed but no url in response: %s", body)
+                        return None
+                    # Download the video
+                    return self._download_video(video_url)
+
+                if status in ("failed", "error", "cancelled"):
+                    logger.error("Agnes video task %s failed: %s", video_id, body.get("error"))
+                    return None
+
+                logger.debug("Agnes video %s: status=%s progress=%s", video_id, status, body.get("progress"))
+
+            except Exception as exc:
+                logger.debug("Agnes poll error (non-fatal): %s", exc)
+
+            time.sleep(poll_interval)
+            elapsed += poll_interval
+
+        logger.warning("Agnes video %s timed out after %ss", video_id, DEFAULT_TIMEOUT)
+        return None
+
+    def _download_video(self, video_url: str) -> Optional[str]:
+        """Download the video MP4 to local cache and return the file path."""
+        try:
+            with httpx.Client(timeout=120) as client:
+                resp = client.get(video_url)
+                resp.raise_for_status()
+                local_path = save_bytes_video(resp.content, prefix="agnes", extension="mp4")
+                return str(local_path)
+        except Exception as exc:
+            logger.error("Failed to download Agnes video from %s: %s", video_url, exc)
+            return None
 
 
-def register(ctx: Any) -> None:
+# ── Plugin entry point ───────────────────────────────────────────────
+
+
+def register(ctx) -> None:
+    """Plugin entry point — wire AgnesVideoGenProvider into the registry."""
     ctx.register_video_gen_provider(AgnesVideoGenProvider())

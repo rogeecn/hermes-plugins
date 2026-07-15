@@ -1,304 +1,329 @@
-"""Agnes AI image generation backend for Hermes.
+"""Agnes AI image generation backend.
 
-Implements Agnes Image 2.1 Flash synchronous API:
-POST /images/generations -> image URL or base64 data.
+Wraps the Agnes AI image API (agnes-image-2.0-flash / 2.1-flash) as an
+:class:`ImageGenProvider` implementation.
 
-Configuration sources (in priority order):
-    1. image_gen.api_key   — config.yaml section
-    2. AGNES_AI_API_KEY    — environment variable
-    3. image_gen.base_url  — config.yaml section
-    4. image_gen.model     — config.yaml section
+API docs: https://agnes-ai.com/zh-Hans/docs/quickstart
+Endpoint: POST https://apihub.agnes-ai.com/v1/images/generations
 
-Image-to-image inputs are documented as HTTP(S) URLs in extra_body.image.
-Local file paths are rejected because the API expects URL strings.
+Supports:
+  - Text-to-image (文生图)
+  - Image-to-image (图生图) — pass image_url / reference_image_urls
+  - Multi-image composition (多图合成)
+
+Auth: AGNES_API_KEY env var (Bearer token)
+Base URL: AGNES_BASE_URL env var (default: https://apihub.agnes-ai.com/v1)
 """
+
 from __future__ import annotations
 
+import base64
 import logging
 import os
-from typing import Any, Dict, List
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
-import requests
+import httpx
 
 from agent.image_gen_provider import (
     DEFAULT_ASPECT_RATIO,
     ImageGenProvider,
-    error_response,
     resolve_aspect_ratio,
     save_b64_image,
+    save_url_image,
     success_response,
+    error_response,
 )
 
 logger = logging.getLogger(__name__)
 
-_MODEL = "agnes-image-2.1-flash"
-_DEFAULT_BASE_URL = "https://apihub.agnes-ai.com/v1"
+# ── Constants ────────────────────────────────────────────────────────
 
-_SIZE_MAP: Dict[str, str] = {
-    "landscape": "1536x1024",
+DEFAULT_BASE_URL = "https://apihub.agnes-ai.com/v1"
+
+# Aspect ratio → pixel size mapping (Agnes accepts WxH strings)
+_ASPECT_TO_SIZE: Dict[str, str] = {
+    "landscape": "1024x768",
     "square": "1024x1024",
-    "portrait": "1024x1536",
+    "portrait": "768x1024",
 }
 
+# Model catalog
+_MODELS: Dict[str, Dict[str, Any]] = {
+    "agnes-image-2.0-flash": {
+        "display": "Agnes Image 2.0 Flash",
+        "speed": "~3-5s",
+        "strengths": "Fast text-to-image, image-to-image, multi-image composition",
+        "price": "$0/img (free tier)",
+    },
+    "agnes-image-2.1-flash": {
+        "display": "Agnes Image 2.1 Flash",
+        "speed": "~3-5s",
+        "strengths": "Latest image model with improved quality",
+        "price": "$0/img (free tier)",
+    },
+}
 
-# ── helpers ──────────────────────────────────────────────────────────
+DEFAULT_MODEL = "agnes-image-2.0-flash"
+DEFAULT_TIMEOUT = 120
+MAX_REFERENCE_IMAGES = 4
 
-
-def _is_http_url(value: str) -> bool:
-    from urllib.parse import urlparse
-
-    parsed = urlparse(value)
-    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
-
-
-def _normalize_image_urls(value: Any) -> List[str]:
-    """Normalize image-to-image inputs.
-
-    Agnes Image 2.1 Flash expects HTTP(S) URL strings in extra_body.image.
-    Local paths are rejected with a clear error.
-    """
-    if isinstance(value, str):
-        raw = [value]
-    elif isinstance(value, (list, tuple)):
-        raw = list(value)
-    else:
-        raw = []
-
-    images: List[str] = []
-    for item in raw:
-        s = str(item or "").strip()
-        if not s:
-            continue
-        if not _is_http_url(s):
-            raise ValueError(
-                f"Agnes image-to-image input must be an HTTP(S) URL: {s}"
-            )
-        images.append(s)
-    return images
+# Retry config for transient 503 "image queue is full" errors
+MAX_RETRIES = 4
+RETRY_BASE_DELAY = 5   # seconds; 5, 10, 15, 20
 
 
-def _load_config() -> Dict[str, Any]:
-    try:
-        from hermes_cli.config import load_config
-
-        cfg = load_config()
-        section = cfg.get("image_gen") if isinstance(cfg, dict) else None
-        return section if isinstance(section, dict) else {}
-    except Exception as exc:
-        logger.debug("Could not load image_gen config: %s", exc)
-        return {}
+def _resolve_credentials() -> tuple[str, str]:
+    """Return (api_key, base_url) from env vars."""
+    api_key = os.getenv("AGNES_API_KEY", "").strip()
+    base_url = os.getenv("AGNES_BASE_URL", "").strip().rstrip("/") or DEFAULT_BASE_URL
+    return api_key, base_url
 
 
-# ── config resolution helpers ────────────────────────────────────────
-
-
-def _resolve_api_key(cfg: dict) -> str:
-    return str(cfg.get("api_key") or os.environ.get("AGNES_AI_API_KEY", "")).strip()
-
-
-def _resolve_base_url(cfg: dict) -> str:
-    return str(cfg.get("base_url") or _DEFAULT_BASE_URL).strip().rstrip("/")
-
-
-def _resolve_model(cfg: dict, **kwargs: Any) -> str:
-    return str(kwargs.get("model") or cfg.get("model") or _MODEL).strip()
-
-
-# ── provider ─────────────────────────────────────────────────────────
+def _image_ref_to_url(value: str) -> str:
+    """Convert a local file path to a data URI; pass through URLs unchanged."""
+    ref = (value or "").strip()
+    if not ref:
+        return ""
+    lower = ref.lower()
+    if lower.startswith(("http://", "https://", "data:image/")):
+        return ref
+    path = Path(ref).expanduser()
+    if not path.is_file():
+        return ref
+    import mimetypes
+    mime = mimetypes.guess_type(path.name)[0] or "image/png"
+    if not mime.startswith("image/"):
+        return ref
+    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+    return f"data:{mime};base64,{encoded}"
 
 
 class AgnesImageGenProvider(ImageGenProvider):
+    """Agnes AI image generation backend."""
+
     @property
     def name(self) -> str:
-        return "agnes-ai"
+        return "agnes"
 
     @property
     def display_name(self) -> str:
         return "Agnes AI"
 
     def is_available(self) -> bool:
-        cfg = _load_config()
-        api_key = _resolve_api_key(cfg)
-        base_url = _resolve_base_url(cfg)
-        return bool(api_key and base_url)
+        api_key, _ = _resolve_credentials()
+        return bool(api_key)
 
     def list_models(self) -> List[Dict[str, Any]]:
-        cfg = _load_config()
-        model = _resolve_model(cfg)
         return [
             {
-                "id": model,
-                "display": model,
-                "speed": "provider-dependent",
-                "strengths": "OpenAI-compatible image generation, image-to-image via extra_body.image",
+                "id": mid,
+                "display": meta.get("display", mid),
+                "speed": meta.get("speed", ""),
+                "strengths": meta.get("strengths", ""),
+                "price": meta.get("price", ""),
             }
+            for mid, meta in _MODELS.items()
         ]
 
-    def default_model(self) -> str:
-        cfg = _load_config()
-        return _resolve_model(cfg)
+    def default_model(self) -> Optional[str]:
+        return DEFAULT_MODEL
 
     def get_setup_schema(self) -> Dict[str, Any]:
         return {
             "name": "Agnes AI",
             "badge": "free",
-            "tag": "Image generate by Agnes AI",
-            "env_vars": [{"key": "AGNES_AI_API_KEY"}],
+            "tag": "agnes-image-2.0-flash — text-to-image, image-to-image, multi-image composition",
+            "env_vars": [
+                {
+                    "key": "AGNES_API_KEY",
+                    "prompt": "Agnes AI API key",
+                    "url": "https://agnes-ai.com",
+                },
+                {
+                    "key": "AGNES_BASE_URL",
+                    "prompt": "Agnes AI base URL (default: https://apihub.agnes-ai.com/v1)",
+                    "url": "",
+                },
+            ],
+        }
+
+    def capabilities(self) -> Dict[str, Any]:
+        return {
+            "modalities": ["text", "image"],
+            "max_reference_images": MAX_REFERENCE_IMAGES,
         }
 
     def generate(
         self,
         prompt: str,
         aspect_ratio: str = DEFAULT_ASPECT_RATIO,
+        *,
+        image_url: Optional[str] = None,
+        reference_image_urls: Optional[List[str]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        cfg = _load_config()
-        api_key = _resolve_api_key(cfg)
-        base_url = _resolve_base_url(cfg)
-        model = _resolve_model(cfg, **kwargs)
-        aspect = resolve_aspect_ratio(aspect_ratio)
+        """Generate or edit an image via the Agnes AI API.
 
-        # validation
-        if not prompt or not str(prompt).strip():
+        Routing:
+          - image_url or reference_image_urls present → image-to-image / multi-image
+          - otherwise → text-to-image
+        """
+        api_key, base_url = _resolve_credentials()
+        if not api_key:
             return error_response(
-                error="Prompt is required",
-                error_type="invalid_argument",
-                provider=self.name,
-                aspect_ratio=aspect,
-            )
-        if not api_key or not base_url:
-            return error_response(
-                error="image_gen.api_key and image_gen.base_url are required",
-                error_type="auth_required",
-                provider=self.name,
-                model=model,
+                error="AGNES_API_KEY not set",
+                error_type="auth_missing",
+                provider="agnes",
                 prompt=prompt,
-                aspect_ratio=aspect,
+                aspect_ratio=aspect_ratio,
             )
 
-        # build payload
-        payload: Dict[str, Any] = {
+        aspect = resolve_aspect_ratio(aspect_ratio)
+        size = _ASPECT_TO_SIZE.get(aspect, "1024x768")
+        model = (kwargs.get("model") or DEFAULT_MODEL).strip()
+
+        # Determine modality and build image array
+        image_inputs: List[str] = []
+        modality = "text"
+
+        if image_url:
+            normalized = _image_ref_to_url(image_url)
+            if normalized:
+                image_inputs.append(normalized)
+                modality = "image"
+
+        if reference_image_urls:
+            for ref in reference_image_urls[:MAX_REFERENCE_IMAGES]:
+                normalized = _image_ref_to_url(ref)
+                if normalized:
+                    image_inputs.append(normalized)
+                    modality = "image"
+
+        # Build request body
+        body: Dict[str, Any] = {
             "model": model,
-            "prompt": str(prompt).strip(),
-            "size": _SIZE_MAP.get(aspect, _SIZE_MAP["square"]),
-            "n": 1,
+            "prompt": prompt,
+            "size": size,
+            "extra_body": {
+                "response_format": "url",
+            },
         }
 
-        # image-to-image
-        input_images = _normalize_image_urls(
-            kwargs.get("images") or kwargs.get("image") or kwargs.get("input_image")
-        )
-        if input_images:
-            payload["extra_body"] = {
-                "image": input_images,
-                "response_format": "url",
-            }
+        if image_inputs:
+            body["extra_body"]["image"] = image_inputs
 
+        url = f"{base_url}/images/generations"
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         }
 
-        # call API
-        try:
-            resp = requests.post(
-                f"{base_url}/images/generations",
-                headers=headers,
-                json=payload,
-                timeout=180,
-            )
-            resp.raise_for_status()
-            result = resp.json()
-        except requests.HTTPError as exc:
-            return self._handle_http_error(exc, model, prompt, aspect)
-        except requests.Timeout:
+        # Agnes API may return 503 "image queue is full" under load;
+        # retry with exponential backoff.
+        last_error: Optional[str] = None
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                with httpx.Client(timeout=DEFAULT_TIMEOUT) as client:
+                    response = client.post(url, headers=headers, json=body)
+                    response.raise_for_status()
+                    result = response.json()
+                break  # success
+            except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code
+                body_text = exc.response.text[:500]
+                # 503 with "queue is full" → transient, retryable
+                if status == 503 and attempt < MAX_RETRIES:
+                    delay = RETRY_BASE_DELAY * (attempt + 1)
+                    logger.info(
+                        "Agnes API 503 (queue full), retry %d/%d in %ds",
+                        attempt + 1, MAX_RETRIES, delay,
+                    )
+                    last_error = f"Agnes API HTTP {status}: {body_text}"
+                    time.sleep(delay)
+                    continue
+                err_msg = f"Agnes API HTTP {status}: {body_text}"
+                logger.warning(err_msg)
+                return error_response(
+                    error=err_msg,
+                    error_type="api_error",
+                    provider="agnes",
+                    model=model,
+                    prompt=prompt,
+                    aspect_ratio=aspect,
+                )
+            except Exception as exc:
+                logger.warning("Agnes image generation failed: %s", exc, exc_info=True)
+                return error_response(
+                    error=f"Agnes image generation failed: {exc}",
+                    error_type=type(exc).__name__,
+                    provider="agnes",
+                    model=model,
+                    prompt=prompt,
+                    aspect_ratio=aspect,
+                )
+        else:
+            # All retries exhausted
             return error_response(
-                error="Image generation timed out (180s)",
-                error_type="timeout",
-                provider=self.name,
-                model=model,
-                prompt=prompt,
-                aspect_ratio=aspect,
-            )
-        except Exception as exc:
-            return error_response(
-                error=f"Image generation error: {exc}",
+                error=last_error or "Agnes API exhausted all retries",
                 error_type="api_error",
-                provider=self.name,
+                provider="agnes",
                 model=model,
                 prompt=prompt,
                 aspect_ratio=aspect,
             )
 
-        # parse response
-        data = result.get("data") if isinstance(result, dict) else None
-        if not data:
+        # Parse response: data[0].url or data[0].b64_json
+        data_list = result.get("data", [])
+        if not data_list:
             return error_response(
-                error=f"Provider returned no data: {str(result)[:500]}",
+                error="Agnes API returned empty data array",
                 error_type="empty_response",
-                provider=self.name,
+                provider="agnes",
                 model=model,
                 prompt=prompt,
                 aspect_ratio=aspect,
             )
 
-        first = data[0]
-        image_ref = None
+        first = data_list[0]
+        image_url_out = first.get("url")
+        b64_json = first.get("b64_json")
 
-        if isinstance(first, dict):
-            if first.get("url"):
-                image_ref = first["url"]
-            elif first.get("b64_json"):
-                image_ref = save_b64_image(first["b64_json"])
-
-        if not image_ref:
+        if image_url_out:
+            # Download URL to local cache for reliable delivery
+            try:
+                local_path = save_url_image(image_url_out, prefix="agnes")
+                image_out = str(local_path)
+            except Exception as exc:
+                logger.debug("Failed to cache Agnes image URL, returning raw URL: %s", exc)
+                image_out = image_url_out
+        elif b64_json:
+            local_path = save_b64_image(b64_json, prefix="agnes")
+            image_out = str(local_path)
+        else:
             return error_response(
-                error=f"No image URL or b64_json in response: {str(first)[:500]}",
-                error_type="empty_response",
-                provider=self.name,
+                error="Agnes API returned no url or b64_json in data[0]",
+                error_type="missing_image",
+                provider="agnes",
                 model=model,
                 prompt=prompt,
                 aspect_ratio=aspect,
             )
 
         return success_response(
-            image=image_ref,
-            provider=self.name,
+            image=image_out,
             model=model,
             prompt=prompt,
             aspect_ratio=aspect,
-        )
-
-    # ── error helpers ───────────────────────────────────────────────
-
-    @staticmethod
-    def _handle_http_error(
-        exc: requests.HTTPError,
-        model: str,
-        prompt: str,
-        aspect: str,
-    ) -> Dict[str, Any]:
-        resp = exc.response
-        status = resp.status_code if resp is not None else 0
-        try:
-            body = resp.json() if resp is not None else {}
-            err = (
-                body.get("error", {}).get("message")
-                if isinstance(body.get("error"), dict)
-                else body.get("error")
-            )
-            err = err or str(body)[:500]
-        except Exception:
-            err = resp.text[:500] if resp is not None else str(exc)
-        return error_response(
-            error=f"Image generation failed ({status}): {err}",
-            error_type="api_error",
-            provider="agnes-ai",
-            model=model,
-            prompt=prompt,
-            aspect_ratio=aspect,
+            provider="agnes",
+            modality=modality,
         )
 
 
-def register(ctx: Any) -> None:
+# ── Plugin entry point ───────────────────────────────────────────────
+
+
+def register(ctx) -> None:
+    """Plugin entry point — wire AgnesImageGenProvider into the registry."""
     ctx.register_image_gen_provider(AgnesImageGenProvider())

@@ -1,6 +1,7 @@
-name: video_gen
+name: agnes
 version: 1.0.0
-description: "Agnes AI video generation backend for Agnes-Video-V2.0."
-author: local
+description: "Agnes AI video generation backend (agnes-video-v2.0). Supports text-to-video, image-to-video, and keyframe animation via async task API."
+author: user
 kind: backend
-requires_env: []
+requires_env:
+  - AGNES_API_KEY

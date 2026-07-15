@@ -1,6 +1,7 @@
-name: image_gen
+name: agnes
 version: 1.0.0
-description: "Agnes AI image generation backend for /v1/images/generations."
-author: local
+description: "Agnes AI image generation backend (agnes-image-2.0-flash, agnes-image-2.1-flash). Supports text-to-image, image-to-image, and multi-image composition."
+author: user
 kind: backend
-requires_env: []
+requires_env:
+  - AGNES_API_KEY
