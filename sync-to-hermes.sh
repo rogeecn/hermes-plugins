@@ -71,5 +71,43 @@ done
 
 echo "==> Done"
 echo ""
-echo "Restart Hermes to pick up changes:"
-echo "  hermes gateway restart   # or /restart in your platform"
+
+# List running gateway services and prompt for restart.
+# Profiles with systemd services: hermes-gateway[-<profile>].service
+# Profiles without: gochat, reverse-researcher (share default gateway)
+PROFILES=("default")
+while IFS= read -r svc; do
+    # Extract profile name from service name: hermes-gateway-<profile>.service
+    if [[ "$svc" =~ ^hermes-gateway-(.+)\.service$ ]]; then
+        PROFILES+=("${BASH_REMATCH[1]}")
+    fi
+done < <(systemctl --user list-units 'hermes-gateway*.service' --no-legend --plain 2>/dev/null | awk '{print $1}')
+
+echo "==> Running gateway profiles: ${PROFILES[*]}"
+echo ""
+echo "To restart all gateways so plugin changes take effect:"
+echo ""
+for p in "${PROFILES[@]}"; do
+    if [[ "$p" == "default" ]]; then
+        echo "  hermes gateway restart"
+    else
+        echo "  hermes -p $p gateway restart"
+    fi
+done
+echo ""
+read -rp "Restart all gateways now? [y/N] " answer
+if [[ "${answer,,}" == "y" ]]; then
+    for p in "${PROFILES[@]}"; do
+        if [[ "$p" == "default" ]]; then
+            echo -n "  default ... "
+            hermes gateway restart 2>&1 | tail -1 || echo "failed"
+        else
+            echo -n "  $p ... "
+            hermes -p "$p" gateway restart 2>&1 | tail -1 || echo "failed"
+        fi
+    done
+    echo ""
+    echo "  ✓ All gateways restarted"
+else
+    echo "  Skipped — restart manually when ready."
+fi
